@@ -248,65 +248,134 @@ def format_number(val):
 
 
 def parse_excel_file(uploaded_file):
-    """Parse the uploaded Excel file and extract data rows."""
+    """Parse the uploaded Excel file and extract data rows.
+    Supports both old format (GL_016) and new format (0903).
+    Automatically searches all sheets to find the proper data table.
+    """
     wb = openpyxl.load_workbook(uploaded_file, data_only=True)
-    ws = wb.active
-    sheet_name = ws.title
-
-    # Find header row (row 8-9 based on analysis) and data start
+    
+    ws = None
+    is_new_format = False
     header_row = None
     data_start = None
     data_end = None
 
-    for i, row in enumerate(ws.iter_rows(min_row=1), 1):
-        vals = [cell.value for cell in row]
-        # Header row detection
-        if vals[0] and 'nguồn bút toán' in str(vals[0]).lower():
-            header_row = i
-        # Data start after "Số dư đầu kỳ"
-        if vals[0] and 'số dư đầu kỳ' in str(vals[0]).lower():
-            data_start = i + 1
-        # Data end at "Cộng phát sinh"
-        if vals[0] and 'cộng phát sinh' in str(vals[0]).lower():
-            data_end = i - 1
-            total_row = i
+    # ── Search through all worksheets to find the data structure ──
+    for sheet in wb.worksheets:
+        temp_is_new_format = False
+        temp_header_row = None
+        temp_data_start = None
+        temp_data_end = None
+        
+        # Scan the first 100 rows to find headers
+        for i, row in enumerate(sheet.iter_rows(min_row=1, max_row=100), 1):
+            vals = [cell.value for cell in row]
+            row_text = ' '.join([str(v).lower().strip() for v in vals[:10] if v is not None])
+
+            # New format detection (0903)
+            if 'nguồn phát sinh' in row_text:
+                temp_is_new_format = True
+                temp_header_row = i
+                if temp_data_start is None:
+                    temp_data_start = i + 1
+            # Old format detection (GL_016)
+            elif 'nguồn bút toán' in row_text:
+                temp_header_row = i
+                
+            # Old format: data start after "Số dư đầu kỳ"
+            if 'số dư đầu kỳ' in row_text:
+                temp_data_start = i + 1
+                
+            # End markers
+            if 'tổng cộng' in row_text or 'cộng phát sinh' in row_text:
+                temp_data_end = i - 1
+                break
+                
+        # If we found a valid starting point, we select this sheet
+        if temp_data_start is not None:
+            ws = sheet
+            is_new_format = temp_is_new_format
+            header_row = temp_header_row
+            data_start = temp_data_start
+            data_end = temp_data_end
+            
+            # If the end marker wasn't found in the first 100 rows, scan the rest of the sheet
+            if data_end is None:
+                for i, row in enumerate(ws.iter_rows(min_row=data_start, max_row=ws.max_row), data_start):
+                    vals = [cell.value for cell in row]
+                    row_text = ' '.join([str(v).lower().strip() for v in vals[:10] if v is not None])
+                    if 'tổng cộng' in row_text or 'cộng phát sinh' in row_text:
+                        data_end = i - 1
+                        break
             break
 
-    if data_start is None or data_end is None:
+    # If no sheet matches the expected structure
+    if ws is None or data_start is None:
+        if ws is None: ws = wb.active # fallback
         st.error("Không tìm thấy cấu trúc dữ liệu phù hợp trong file!")
         return None, None, None, None
 
-    # Extract data rows
+    if data_end is None:
+        data_end = ws.max_row
+        
+    sheet_name = ws.title
+
+    # ── Extract data rows ──
     data_rows = []
     for i, row in enumerate(ws.iter_rows(min_row=data_start, max_row=data_end), data_start):
         vals = [cell.value for cell in row]
-        # Skip empty rows or sub-headers
-        if vals[0] is None and vals[1] is None and vals[5] is None and vals[6] is None:
-            continue
-        data_rows.append({
-            'STT': len(data_rows) + 1,
-            'Dòng Excel': i,
-            'Nguồn bút toán': vals[0] if vals[0] else '',
-            'Ngày': vals[1].strftime('%d/%m/%Y') if hasattr(vals[1], 'strftime') else (str(vals[1]) if vals[1] else ''),
-            'Số CT Phân hệ phụ': str(vals[2]).lstrip("'") if vals[2] else '',
-            'Số CT Phân hệ GL': vals[3] if vals[3] else '',
-            'Diễn giải': vals[4] if vals[4] else '',
-            'Số phát sinh Nợ': vals[5] if vals[5] is not None else 0,
-            'Số phát sinh Có': vals[6] if vals[6] is not None else 0,
-            'Người lập': str(vals[7]).strip() if vals[7] else '',
-        })
+        vals.extend([None] * (25 - len(vals)))  # Padding to avoid IndexError
+
+        if is_new_format:
+            # New format (0903): 21 columns
+            if vals[0] is None and vals[1] is None and vals[13] is None and vals[14] is None:
+                continue
+            data_rows.append({
+                'STT': len(data_rows) + 1,
+                'Dòng Excel': i,
+                'Nguồn phát sinh': vals[0] if vals[0] else '',
+                'Số giao dịch': str(vals[1]).lstrip("'") if vals[1] else '',
+                'Ngày giao dịch': vals[2].strftime('%d/%m/%Y') if hasattr(vals[2], 'strftime') else (str(vals[2]) if vals[2] else ''),
+                'Nội dung': vals[17] if vals[17] else '',
+                'Nợ nguyên tệ': vals[13] if vals[13] is not None else 0,
+                'Có nguyên tệ': vals[14] if vals[14] is not None else 0,
+                'Người tạo': str(vals[19]).strip() if vals[19] else '',
+            })
+        else:
+            # Old format (GL_016): 8 columns
+            if vals[0] is None and vals[1] is None and vals[5] is None and vals[6] is None:
+                continue
+            data_rows.append({
+                'STT': len(data_rows) + 1,
+                'Dòng Excel': i,
+                'Nguồn phát sinh': vals[0] if vals[0] else '',
+                'Số giao dịch': str(vals[2]).lstrip("'") if vals[2] else '',
+                'Ngày giao dịch': vals[1].strftime('%d/%m/%Y') if hasattr(vals[1], 'strftime') else (str(vals[1]) if vals[1] else ''),
+                'Nội dung': vals[4] if vals[4] else '',
+                'Nợ nguyên tệ': vals[5] if vals[5] is not None else 0,
+                'Có nguyên tệ': vals[6] if vals[6] is not None else 0,
+                'Người tạo': str(vals[7]).strip() if vals[7] else '',
+            })
 
     df = pd.DataFrame(data_rows)
 
-    # Get totals from the file
+    # ── Get totals from the file ──
     total_vals = None
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
+    for row in ws.iter_rows(min_row=data_start, max_row=ws.max_row):
         vals = [cell.value for cell in row]
-        if vals[0] and 'cộng phát sinh' in str(vals[0]).lower():
-            total_vals = {
-                'Tổng Nợ (file)': vals[5] if vals[5] else 0,
-                'Tổng Có (file)': vals[6] if vals[6] else 0,
-            }
+        row_text = ' '.join([str(v).lower().strip() for v in vals[:10] if v is not None])
+        if 'tổng cộng' in row_text or 'cộng phát sinh' in row_text:
+            vals.extend([None] * (25 - len(vals)))
+            if is_new_format:
+                total_vals = {
+                    'Tổng Nợ (file)': vals[13] if vals[13] else 0,
+                    'Tổng Có (file)': vals[14] if vals[14] else 0,
+                }
+            else:
+                total_vals = {
+                    'Tổng Nợ (file)': vals[5] if vals[5] else 0,
+                    'Tổng Có (file)': vals[6] if vals[6] else 0,
+                }
             break
 
     return df, total_vals, wb, sheet_name
@@ -327,8 +396,8 @@ def analyze_data(df, total_vals):
     """Analyze debit vs credit and find discrepancies using smart matching."""
 
     # Calculate totals from data
-    total_no = df['Số phát sinh Nợ'].sum()
-    total_co = df['Số phát sinh Có'].sum()
+    total_no = df['Nợ nguyên tệ'].sum()
+    total_co = df['Có nguyên tệ'].sum()
     chenh_lech = total_no - total_co
 
     results = {
@@ -343,16 +412,16 @@ def analyze_data(df, total_vals):
     # ════════════════════════════════════════════════
     # Step 1: Group by "Người lập" and check balance
     # ════════════════════════════════════════════════
-    person_groups = df.groupby('Người lập', sort=False)
+    person_groups = df.groupby('Người tạo', sort=False)
     person_summary = []
     unbalanced_persons = []
 
     for person, group_df in person_groups:
-        sum_no = group_df['Số phát sinh Nợ'].sum()
-        sum_co = group_df['Số phát sinh Có'].sum()
+        sum_no = group_df['Nợ nguyên tệ'].sum()
+        sum_co = group_df['Có nguyên tệ'].sum()
         cl = sum_no - sum_co
         person_summary.append({
-            'Người lập': person,
+            'Người tạo': person,
             'Tổng Nợ': sum_no,
             'Tổng Có': sum_co,
             'Chênh lệch': cl,
@@ -372,7 +441,7 @@ def analyze_data(df, total_vals):
     matched_details = {}
 
     for person in unbalanced_persons:
-        person_df = df[df['Người lập'] == person].copy()
+        person_df = df[df['Người tạo'] == person].copy()
         person_df = person_df.reset_index(drop=True)
 
         matched = [False] * len(person_df)
@@ -381,8 +450,8 @@ def analyze_data(df, total_vals):
         no_rows = []
         co_rows = []
         for idx, row in person_df.iterrows():
-            no_val = row['Số phát sinh Nợ'] if pd.notna(row['Số phát sinh Nợ']) else 0
-            co_val = row['Số phát sinh Có'] if pd.notna(row['Số phát sinh Có']) else 0
+            no_val = row['Nợ nguyên tệ'] if pd.notna(row['Nợ nguyên tệ']) else 0
+            co_val = row['Có nguyên tệ'] if pd.notna(row['Có nguyên tệ']) else 0
             if abs(no_val) > 0 and abs(co_val) == 0:
                 no_rows.append(idx)
             elif abs(co_val) > 0 and abs(no_val) == 0:
@@ -393,12 +462,12 @@ def analyze_data(df, total_vals):
         for ni in no_rows:
             if matched[ni]:
                 continue
-            no_val = person_df.loc[ni, 'Số phát sinh Nợ']
+            no_val = person_df.loc[ni, 'Nợ nguyên tệ']
 
             for ci in co_rows:
                 if ci in used_co or matched[ci]:
                     continue
-                co_val = person_df.loc[ci, 'Số phát sinh Có']
+                co_val = person_df.loc[ci, 'Có nguyên tệ']
 
                 if abs(abs(no_val) - abs(co_val)) < 0.01:
                     matched[ni] = True
@@ -408,19 +477,19 @@ def analyze_data(df, total_vals):
 
         # ──── Pass 2: Nợ dương + Nợ âm triệt tiêu (chỉ cần số tiền) ────
         unmatched_no_indices = [i for i in no_rows if not matched[i]]
-        positive_no = [i for i in unmatched_no_indices if person_df.loc[i, 'Số phát sinh Nợ'] > 0]
-        negative_no = [i for i in unmatched_no_indices if person_df.loc[i, 'Số phát sinh Nợ'] < 0]
+        positive_no = [i for i in unmatched_no_indices if person_df.loc[i, 'Nợ nguyên tệ'] > 0]
+        negative_no = [i for i in unmatched_no_indices if person_df.loc[i, 'Nợ nguyên tệ'] < 0]
 
         used_neg = set()
         for pi in positive_no:
             if matched[pi]:
                 continue
-            p_val = person_df.loc[pi, 'Số phát sinh Nợ']
+            p_val = person_df.loc[pi, 'Nợ nguyên tệ']
 
             for ngi in negative_no:
                 if ngi in used_neg or matched[ngi]:
                     continue
-                n_val = person_df.loc[ngi, 'Số phát sinh Nợ']
+                n_val = person_df.loc[ngi, 'Nợ nguyên tệ']
 
                 if abs(p_val + n_val) < 0.01:
                     matched[pi] = True
@@ -431,26 +500,26 @@ def analyze_data(df, total_vals):
         # ──── Pass 2b: Nhóm Nợ triệt tiêu (tổng nhóm = 0) ────
         still_unmatched_no = [i for i in no_rows if not matched[i]]
         if len(still_unmatched_no) > 1:
-            no_sum = sum(person_df.loc[i, 'Số phát sinh Nợ'] for i in still_unmatched_no)
+            no_sum = sum(person_df.loc[i, 'Nợ nguyên tệ'] for i in still_unmatched_no)
             if abs(no_sum) < 0.01:
                 for i in still_unmatched_no:
                     matched[i] = True
 
         # ──── Pass 3: Có dương + Có âm triệt tiêu (chỉ cần số tiền) ────
         unmatched_co_indices = [i for i in co_rows if not matched[i]]
-        positive_co = [i for i in unmatched_co_indices if person_df.loc[i, 'Số phát sinh Có'] > 0]
-        negative_co = [i for i in unmatched_co_indices if person_df.loc[i, 'Số phát sinh Có'] < 0]
+        positive_co = [i for i in unmatched_co_indices if person_df.loc[i, 'Có nguyên tệ'] > 0]
+        negative_co = [i for i in unmatched_co_indices if person_df.loc[i, 'Có nguyên tệ'] < 0]
 
         used_neg_co = set()
         for pi in positive_co:
             if matched[pi]:
                 continue
-            p_val = person_df.loc[pi, 'Số phát sinh Có']
+            p_val = person_df.loc[pi, 'Có nguyên tệ']
 
             for ngi in negative_co:
                 if ngi in used_neg_co or matched[ngi]:
                     continue
-                n_val = person_df.loc[ngi, 'Số phát sinh Có']
+                n_val = person_df.loc[ngi, 'Có nguyên tệ']
 
                 if abs(p_val + n_val) < 0.01:
                     matched[pi] = True
@@ -461,7 +530,7 @@ def analyze_data(df, total_vals):
         # ──── Pass 3b: Nhóm Có triệt tiêu (tổng nhóm = 0) ────
         still_unmatched_co = [i for i in co_rows if not matched[i]]
         if len(still_unmatched_co) > 1:
-            co_sum = sum(person_df.loc[i, 'Số phát sinh Có'] for i in still_unmatched_co)
+            co_sum = sum(person_df.loc[i, 'Có nguyên tệ'] for i in still_unmatched_co)
             if abs(co_sum) < 0.01:
                 for i in still_unmatched_co:
                     matched[i] = True
@@ -486,7 +555,7 @@ def analyze_data(df, total_vals):
     # ════════════════════════════════════════════════
     # Gom tất cả dòng chưa khớp từ các người lập có chênh lệch
     unmatched_df = df[
-        (df['Người lập'].isin(unbalanced_persons)) &
+        (df['Người tạo'].isin(unbalanced_persons)) &
         (~df['STT'].isin(global_matched))
     ].copy().reset_index(drop=True)
 
@@ -495,24 +564,24 @@ def analyze_data(df, total_vals):
     if len(unmatched_df) > 0:
         # Lấy dòng có Nợ và dòng có Có
         cross_no = unmatched_df[
-            (unmatched_df['Số phát sinh Nợ'].abs() > 0) &
-            ((unmatched_df['Số phát sinh Có'].fillna(0)).abs() == 0)
+            (unmatched_df['Nợ nguyên tệ'].abs() > 0) &
+            ((unmatched_df['Có nguyên tệ'].fillna(0)).abs() == 0)
         ]
         cross_co = unmatched_df[
-            (unmatched_df['Số phát sinh Có'].abs() > 0) &
-            ((unmatched_df['Số phát sinh Nợ'].fillna(0)).abs() == 0)
+            (unmatched_df['Có nguyên tệ'].abs() > 0) &
+            ((unmatched_df['Nợ nguyên tệ'].fillna(0)).abs() == 0)
         ]
 
         used_cross_co = set()
         for _, no_row in cross_no.iterrows():
             if no_row['STT'] in cross_matched_stts:
                 continue
-            no_val = no_row['Số phát sinh Nợ']
+            no_val = no_row['Nợ nguyên tệ']
 
             for _, co_row in cross_co.iterrows():
                 if co_row['STT'] in used_cross_co or co_row['STT'] in cross_matched_stts:
                     continue
-                co_val = co_row['Số phát sinh Có']
+                co_val = co_row['Có nguyên tệ']
 
                 # Cùng số tiền (khác người lập)
                 if abs(abs(no_val) - abs(co_val)) < 0.01:
@@ -528,7 +597,7 @@ def analyze_data(df, total_vals):
     # Step 3b (Pass 5): Khớp NHÓM — tổng nhiều dòng Nợ = tổng nhiều dòng Có
     # ════════════════════════════════════════════════
     remaining_df = df[
-        (df['Người lập'].isin(unbalanced_persons)) &
+        (df['Người tạo'].isin(unbalanced_persons)) &
         (~df['STT'].isin(global_matched))
     ].copy().reset_index(drop=True)
 
@@ -537,23 +606,23 @@ def analyze_data(df, total_vals):
     if len(remaining_df) > 0:
         # Tách dòng Nợ và Có chưa khớp
         rem_no = remaining_df[
-            (remaining_df['Số phát sinh Nợ'].fillna(0).abs() > 0)
+            (remaining_df['Nợ nguyên tệ'].fillna(0).abs() > 0)
         ].copy()
         rem_co = remaining_df[
-            (remaining_df['Số phát sinh Có'].fillna(0).abs() > 0) &
-            (remaining_df['Số phát sinh Nợ'].fillna(0).abs() == 0)
+            (remaining_df['Có nguyên tệ'].fillna(0).abs() > 0) &
+            (remaining_df['Nợ nguyên tệ'].fillna(0).abs() == 0)
         ].copy()
 
         # Net value cho mỗi dòng (Nợ dương, Có âm)
         no_items = []  # (STT, value)
         for _, r in rem_no.iterrows():
-            nv = r['Số phát sinh Nợ'] if pd.notna(r['Số phát sinh Nợ']) else 0
+            nv = r['Nợ nguyên tệ'] if pd.notna(r['Nợ nguyên tệ']) else 0
             if abs(nv) > 0:
                 no_items.append((r['STT'], nv))
 
         co_items = []
         for _, r in rem_co.iterrows():
-            cv = r['Số phát sinh Có'] if pd.notna(r['Số phát sinh Có']) else 0
+            cv = r['Có nguyên tệ'] if pd.notna(r['Có nguyên tệ']) else 0
             if abs(cv) > 0:
                 co_items.append((r['STT'], cv))
 
@@ -577,8 +646,11 @@ def analyze_data(df, total_vals):
                 # Dùng dict lưu tổng → danh sách STT cho phía Có
                 from itertools import combinations
 
-                # Giới hạn số lượng để tránh bùng nổ tổ hợp
-                max_co_combo = min(len(co_items), 8)
+                # Giới hạn cực kỳ chặt chẽ để tránh bùng nổ tổ hợp
+                if len(co_items) > 30: max_co_combo = 2
+                elif len(co_items) > 15: max_co_combo = 3
+                else: max_co_combo = min(len(co_items), 5)
+                
                 co_sum_map = {}  # sum -> list of STTs
 
                 for size in range(1, max_co_combo + 1):
@@ -592,7 +664,10 @@ def analyze_data(df, total_vals):
                         co_sum_map[rounded_sum].append(combo_stts)
 
                 # Tìm subset Nợ khớp
-                max_no_combo = min(len(no_items), 15)
+                if len(no_items) > 30: max_no_combo = 2
+                elif len(no_items) > 15: max_no_combo = 3
+                else: max_no_combo = min(len(no_items), 5)
+                
                 found_groups = []
 
                 for size in range(1, max_no_combo + 1):
@@ -622,7 +697,7 @@ def analyze_data(df, total_vals):
     if all_new_matched:
         cross_count_per_person = {}
         for stt in all_new_matched:
-            person = df[df['STT'] == stt]['Người lập'].values[0]
+            person = df[df['STT'] == stt]['Người tạo'].values[0]
             cross_count_per_person[person] = cross_count_per_person.get(person, 0) + 1
 
         for person, count in cross_count_per_person.items():
@@ -635,9 +710,9 @@ def analyze_data(df, total_vals):
     # ════════════════════════════════════════════════
     all_unmatched_rows = []
     for _, row in df.iterrows():
-        if row['Người lập'] in unbalanced_persons and row['STT'] not in global_matched:
-            no_val = row['Số phát sinh Nợ'] if pd.notna(row['Số phát sinh Nợ']) else 0
-            co_val = row['Số phát sinh Có'] if pd.notna(row['Số phát sinh Có']) else 0
+        if row['Người tạo'] in unbalanced_persons and row['STT'] not in global_matched:
+            no_val = row['Nợ nguyên tệ'] if pd.notna(row['Nợ nguyên tệ']) else 0
+            co_val = row['Có nguyên tệ'] if pd.notna(row['Có nguyên tệ']) else 0
             row_data = row.to_dict()
             row_data['Chênh lệch (Nợ - Có)'] = no_val - co_val
             all_unmatched_rows.append(row_data)
@@ -688,8 +763,8 @@ def create_export(df_original, df_discrepancy, results):
     ws1['A2'].alignment = Alignment(horizontal='center')
 
     # Headers
-    headers = ['STT', 'Dòng Excel', 'Nguồn bút toán', 'Ngày', 'Số CT Phân hệ phụ',
-               'Số CT Phân hệ GL', 'Diễn giải', 'Số phát sinh Nợ', 'Số phát sinh Có']
+    headers = ['STT', 'Dòng Excel', 'Nguồn phát sinh', 'Số giao dịch', 'Ngày giao dịch',
+               'Nội dung', 'Nợ nguyên tệ', 'Có nguyên tệ']
     for col, h in enumerate(headers, 1):
         cell = ws1.cell(row=4, column=col, value=h)
         cell.font = header_font
@@ -705,7 +780,7 @@ def create_export(df_original, df_discrepancy, results):
             cell = ws1.cell(row=i, column=j, value=val)
             cell.font = cell_font
             cell.border = thin_border
-            if col_name in ('Số phát sinh Nợ', 'Số phát sinh Có'):
+            if col_name in ('Nợ nguyên tệ', 'Có nguyên tệ'):
                 cell.alignment = number_align
                 cell.number_format = '#,##0'
             else:
@@ -713,25 +788,25 @@ def create_export(df_original, df_discrepancy, results):
 
     # Totals row
     total_row = 5 + len(df_original)
-    ws1.merge_cells(f'A{total_row}:G{total_row}')
-    ws1.cell(row=total_row, column=1, value='CỘNG PHÁT SINH').font = Font(name='Times New Roman', bold=True, size=11)
+    ws1.merge_cells(f'A{total_row}:F{total_row}')
+    ws1.cell(row=total_row, column=1, value='TỔNG CỘNG').font = Font(name='Times New Roman', bold=True, size=11)
     ws1.cell(row=total_row, column=1).alignment = Alignment(horizontal='center', vertical='center')
     ws1.cell(row=total_row, column=1).border = thin_border
-    for c in range(2, 8):
+    for c in range(2, 7):
         ws1.cell(row=total_row, column=c).border = thin_border
 
-    ws1.cell(row=total_row, column=8, value=results['total_no']).font = Font(name='Times New Roman', bold=True, size=11)
+    ws1.cell(row=total_row, column=7, value=results['total_no']).font = Font(name='Times New Roman', bold=True, size=11)
+    ws1.cell(row=total_row, column=7).number_format = '#,##0'
+    ws1.cell(row=total_row, column=7).alignment = number_align
+    ws1.cell(row=total_row, column=7).border = thin_border
+
+    ws1.cell(row=total_row, column=8, value=results['total_co']).font = Font(name='Times New Roman', bold=True, size=11)
     ws1.cell(row=total_row, column=8).number_format = '#,##0'
     ws1.cell(row=total_row, column=8).alignment = number_align
     ws1.cell(row=total_row, column=8).border = thin_border
 
-    ws1.cell(row=total_row, column=9, value=results['total_co']).font = Font(name='Times New Roman', bold=True, size=11)
-    ws1.cell(row=total_row, column=9).number_format = '#,##0'
-    ws1.cell(row=total_row, column=9).alignment = number_align
-    ws1.cell(row=total_row, column=9).border = thin_border
-
     # Column widths
-    widths = [6, 10, 22, 12, 20, 16, 50, 20, 20]
+    widths = [6, 10, 22, 18, 12, 50, 20, 20]
     for i, w in enumerate(widths, 1):
         ws1.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
@@ -786,8 +861,8 @@ def create_export(df_original, df_discrepancy, results):
         ws2.row_dimensions[start_row].height = 25
 
         # Headers
-        disc_headers = ['STT', 'Dòng Excel', 'Nguồn bút toán', 'Ngày', 'Số CT Phân hệ phụ',
-                        'Số CT Phân hệ GL', 'Diễn giải', 'Số phát sinh Nợ', 'Số phát sinh Có', 'Chênh lệch (Nợ - Có)']
+        disc_headers = ['STT', 'Dòng Excel', 'Nguồn phát sinh', 'Số giao dịch', 'Ngày giao dịch',
+                        'Nội dung', 'Nợ nguyên tệ', 'Có nguyên tệ', 'Chênh lệch (Nợ - Có)']
         error_fill = PatternFill(start_color='4338ca', end_color='4338ca', fill_type='solid')
         for col, h in enumerate(disc_headers, 1):
             cell = ws2.cell(row=start_row + 1, column=col, value=h)
@@ -803,7 +878,7 @@ def create_export(df_original, df_discrepancy, results):
                 cell = ws2.cell(row=i, column=j, value=val)
                 cell.font = cell_font
                 cell.border = thin_border
-                if col_name in ('Số phát sinh Nợ', 'Số phát sinh Có', 'Chênh lệch (Nợ - Có)'):
+                if col_name in ('Nợ nguyên tệ', 'Có nguyên tệ', 'Chênh lệch (Nợ - Có)'):
                     cell.alignment = number_align
                     cell.number_format = '#,##0'
                 else:
@@ -811,14 +886,14 @@ def create_export(df_original, df_discrepancy, results):
 
         # Totals for discrepancy
         t_row = start_row + 2 + len(df_discrepancy)
-        ws2.merge_cells(f'A{t_row}:G{t_row}')
+        ws2.merge_cells(f'A{t_row}:F{t_row}')
         ws2.cell(row=t_row, column=1, value='TỔNG CỘNG').font = Font(name='Times New Roman', bold=True, size=11)
         ws2.cell(row=t_row, column=1).alignment = Alignment(horizontal='center')
         ws2.cell(row=t_row, column=1).border = thin_border
-        for c in range(2, 8):
+        for c in range(2, 7):
             ws2.cell(row=t_row, column=c).border = thin_border
 
-        for col_idx, col_name in [(8, 'Số phát sinh Nợ'), (9, 'Số phát sinh Có'), (10, 'Chênh lệch (Nợ - Có)')]:
+        for col_idx, col_name in [(7, 'Nợ nguyên tệ'), (8, 'Có nguyên tệ'), (9, 'Chênh lệch (Nợ - Có)')]:
             val = df_discrepancy[col_name].sum() if col_name in df_discrepancy.columns else 0
             cell = ws2.cell(row=t_row, column=col_idx, value=val)
             cell.font = Font(name='Times New Roman', bold=True, size=11)
@@ -832,7 +907,7 @@ def create_export(df_original, df_discrepancy, results):
         ws2['A11'].alignment = Alignment(horizontal='center')
 
     # Column widths for sheet 2
-    widths2 = [6, 10, 22, 12, 20, 16, 45, 20, 20, 20]
+    widths2 = [6, 10, 22, 18, 12, 45, 20, 20, 20]
     for i, w in enumerate(widths2, 1):
         ws2.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
@@ -927,8 +1002,8 @@ if uploaded_file is not None:
         # Preview data
         with st.expander("👁️ Xem trước dữ liệu", expanded=False):
             display_df = df.copy()
-            display_df['Số phát sinh Nợ'] = display_df['Số phát sinh Nợ'].apply(format_number)
-            display_df['Số phát sinh Có'] = display_df['Số phát sinh Có'].apply(format_number)
+            display_df['Nợ nguyên tệ'] = display_df['Nợ nguyên tệ'].apply(format_number)
+            display_df['Có nguyên tệ'] = display_df['Có nguyên tệ'].apply(format_number)
             st.dataframe(display_df, use_container_width=True, height=400)
 
         # ─── Step 2: Analyze ───
@@ -1004,9 +1079,9 @@ if uploaded_file is not None:
             if person_summary_df is not None and not person_summary_df.empty:
                 st.markdown("""
                 <div class="glass-panel animate-in">
-                    <h3 style="color: #e0e7ff; margin-top:0;">👥 Tổng hợp theo Người lập</h3>
+                    <h3 style="color: #e0e7ff; margin-top:0;">👥 Tổng hợp theo Người tạo</h3>
                     <p style="color: rgba(255,255,255,0.4); font-size: 0.8rem; margin-bottom:0.5rem;">
-                        Nhóm theo người lập, tính tổng Nợ - Có. Người lập cân bằng (chênh lệch = 0) sẽ được bỏ qua.
+                        Nhóm theo người tạo, tính tổng Nợ - Có. Người tạo cân bằng (chênh lệch = 0) sẽ được bỏ qua.
                     </p>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1019,20 +1094,20 @@ if uploaded_file is not None:
                 with c_a:
                     st.markdown(f"""
                     <div class="stat-card" style="border-color: rgba(52,211,153,0.2);">
-                        <div class="stat-label">✅ Người lập cân bằng (bỏ qua)</div>
+                        <div class="stat-label">✅ Người tạo cân bằng (bỏ qua)</div>
                         <div class="stat-value green">{balanced_count}</div>
                     </div>
                     """, unsafe_allow_html=True)
                 with c_b:
                     st.markdown(f"""
                     <div class="stat-card" style="border-color: rgba(248,113,113,0.2);">
-                        <div class="stat-label">⚠️ Người lập có chênh lệch</div>
+                        <div class="stat-label">⚠️ Người tạo có chênh lệch</div>
                         <div class="stat-value red">{unbalanced_count}</div>
                     </div>
                     """, unsafe_allow_html=True)
 
                 # Show full person summary in expander
-                with st.expander("📋 Xem chi tiết tổng hợp theo Người lập", expanded=False):
+                with st.expander("📋 Xem chi tiết tổng hợp theo Người tạo", expanded=False):
                     display_person = person_summary_df.copy()
                     for nc in ['Tổng Nợ', 'Tổng Có', 'Chênh lệch']:
                         display_person[nc] = display_person[nc].apply(format_number)
@@ -1053,7 +1128,7 @@ if uploaded_file is not None:
                 <div class="glass-panel animate-in">
                     <h3 style="color: #fbbf24; margin-top:0;">🔗 Kết quả đối chiếu thông minh</h3>
                     <p style="color: rgba(255,255,255,0.4); font-size: 0.8rem;">
-                        Với mỗi người lập có chênh lệch, hệ thống so khớp: <br>
+                        Với mỗi người tạo có chênh lệch, hệ thống so khớp: <br>
                         ① Nợ = Có + diễn giải giống ≥80% → bỏ qua<br>
                         ② Nợ dương + Nợ âm triệt tiêu + diễn giải giống ≥80% → bỏ qua<br>
                         ③ Giữ lại các dòng không xác định được
@@ -1064,7 +1139,7 @@ if uploaded_file is not None:
                 # Matching stats per person
                 stats_html = '<div class="glass-panel" style="border-color: rgba(251,191,36,0.15);">'
                 stats_html += '<table class="diff-table"><thead><tr>'
-                stats_html += '<th>Người lập</th><th style="text-align:center">Tổng dòng</th>'
+                stats_html += '<th>Người tạo</th><th style="text-align:center">Tổng dòng</th>'
                 stats_html += '<th style="text-align:center">Đã khớp (bỏ qua)</th>'
                 stats_html += '<th style="text-align:center">Chưa xác định</th>'
                 stats_html += '</tr></thead><tbody>'
@@ -1109,11 +1184,11 @@ if uploaded_file is not None:
                 """, unsafe_allow_html=True)
 
                 # Show per person
-                if 'Người lập' in discrepancy_df.columns:
-                    for person in discrepancy_df['Người lập'].unique():
-                        person_disc = discrepancy_df[discrepancy_df['Người lập'] == person]
-                        person_sum_no = person_disc['Số phát sinh Nợ'].sum()
-                        person_sum_co = person_disc['Số phát sinh Có'].sum()
+                if 'Người tạo' in discrepancy_df.columns:
+                    for person in discrepancy_df['Người tạo'].unique():
+                        person_disc = discrepancy_df[discrepancy_df['Người tạo'] == person]
+                        person_sum_no = person_disc['Nợ nguyên tệ'].sum()
+                        person_sum_co = person_disc['Có nguyên tệ'].sum()
                         person_cl = person_sum_no - person_sum_co
 
                         st.markdown(f"""
@@ -1127,11 +1202,11 @@ if uploaded_file is not None:
                         """, unsafe_allow_html=True)
 
                         display_disc = person_disc.copy()
-                        display_cols = ['STT', 'Dòng Excel', 'Nguồn bút toán', 'Ngày', 'Số CT Phân hệ phụ',
-                                        'Số CT Phân hệ GL', 'Diễn giải', 'Số phát sinh Nợ', 'Số phát sinh Có', 'Chênh lệch (Nợ - Có)']
+                        display_cols = ['STT', 'Dòng Excel', 'Nguồn phát sinh', 'Ngày giao dịch', 'Số giao dịch',
+                                        'Nội dung', 'Nợ nguyên tệ', 'Có nguyên tệ', 'Chênh lệch (Nợ - Có)']
                         display_disc = display_disc[[c for c in display_cols if c in display_disc.columns]]
 
-                        for num_col in ['Số phát sinh Nợ', 'Số phát sinh Có', 'Chênh lệch (Nợ - Có)']:
+                        for num_col in ['Nợ nguyên tệ', 'Có nguyên tệ', 'Chênh lệch (Nợ - Có)']:
                             if num_col in display_disc.columns:
                                 display_disc[num_col] = display_disc[num_col].apply(format_number)
 
@@ -1142,13 +1217,13 @@ if uploaded_file is not None:
                             column_config={
                                 'STT': st.column_config.NumberColumn('STT', width='small'),
                                 'Dòng Excel': st.column_config.NumberColumn('Dòng Excel', width='small'),
-                                'Diễn giải': st.column_config.TextColumn('Diễn giải', width='large'),
+                                'Nội dung': st.column_config.TextColumn('Nội dung', width='large'),
                             }
                         )
 
                 # Overall summary
-                sum_no = discrepancy_df['Số phát sinh Nợ'].sum()
-                sum_co = discrepancy_df['Số phát sinh Có'].sum()
+                sum_no = discrepancy_df['Nợ nguyên tệ'].sum()
+                sum_co = discrepancy_df['Có nguyên tệ'].sum()
                 sum_cl = discrepancy_df['Chênh lệch (Nợ - Có)'].sum()
 
                 st.markdown(f"""
